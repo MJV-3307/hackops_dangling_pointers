@@ -4,25 +4,35 @@ from pymongo import MongoClient
 from gridfs import GridFS
 from dotenv import load_dotenv
 import os
+import tempfile
+import ocrmypdf
 
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
+# ---------------------------------------------------------
 # MongoDB connection
+# ---------------------------------------------------------
+
 client = MongoClient(os.getenv("MONGO_URI"))
 
 db = client[os.getenv("DATABASE_NAME", "BotPressTest")]
 
+# ---------------------------------------------------------
 # GridFS
-# All uploaded PDFs will remain stored here.
+# ---------------------------------------------------------
+#
+# All current OCR-processed PDFs are stored in this GridFS
+# bucket.
+#
 fs = GridFS(db, collection="documents")
 
-# Collection used to keep track of which document is currently
-# being used by Botpress.
-document_metadata = db["document_metadata"]
 
+# ---------------------------------------------------------
+# Home
+# ---------------------------------------------------------
 
 @app.route("/")
 def home():
@@ -30,6 +40,10 @@ def home():
         "message": "Document upload server is running"
     })
 
+
+# ---------------------------------------------------------
+# Upload PDF
+# ---------------------------------------------------------
 
 @app.route("/api/documents/upload", methods=["POST"])
 def upload_document():
@@ -55,83 +69,157 @@ def upload_document():
         }), 400
 
     try:
-        # ---------------------------------------------------------
-        # 1. Store the PDF in GridFS
-        # ---------------------------------------------------------
-        #
-        # The PDF is NOT replacing or deleting any existing PDF.
-        # Every uploaded PDF gets its own GridFS file.
-        #
-        file_id = fs.put(
-            file,
-            filename=file.filename,
-            content_type="application/pdf"
-        )
 
-        # ---------------------------------------------------------
-        # 2. Mark this PDF as the CURRENT document
-        # ---------------------------------------------------------
+        # -------------------------------------------------
+        # Create temporary files
+        # -------------------------------------------------
         #
-        # There will only be one document with:
-        #     type = "current_document"
+        # input_pdf  = original uploaded PDF
+        # output_pdf = OCR-processed PDF
         #
-        # When a new PDF is uploaded, this record is updated to
-        # point to the new GridFS file.
+        # These are temporary and will be deleted after
+        # processing.
         #
-        document_metadata.update_one(
-            {"type": "current_document"},
-            {
-                "$set": {
-                    "fileId": str(file_id),
-                    "fileName": file.filename,
-                    "contentType": "application/pdf"
-                }
-            },
-            upsert=True
-        )
 
-        # ---------------------------------------------------------
-        # 3. Return the information to React
-        # ---------------------------------------------------------
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            input_pdf = os.path.join(
+                temp_dir,
+                "input.pdf"
+            )
+
+            output_pdf = os.path.join(
+                temp_dir,
+                "ocr_output.pdf"
+            )
+
+            # ---------------------------------------------
+            # Save uploaded PDF temporarily
+            # ---------------------------------------------
+
+            file.save(input_pdf)
+
+            # ---------------------------------------------
+            # Run OCR
+            # ---------------------------------------------
+            #
+            # OCRmyPDF creates a searchable/OCR-enabled PDF.
+            #
+            # skip_text=True means:
+            # If the PDF already contains selectable text,
+            # OCRmyPDF will leave that text alone rather
+            # than unnecessarily OCRing it.
+            #
+
+            ocrmypdf.ocr(
+                input_pdf,
+                output_pdf,
+                skip_text=True
+            )
+
+            # ---------------------------------------------
+            # Delete the existing document(s) from GridFS
+            # ---------------------------------------------
+            #
+            # We are intentionally replacing the previous
+            # document.
+            #
+            # Nothing is deleted until the OCR processing
+            # succeeds.
+            #
+
+            existing_files = fs.find()
+
+            for existing_file in existing_files:
+                fs.delete(existing_file._id)
+
+            # ---------------------------------------------
+            # Store the new OCR PDF in GridFS
+            # ---------------------------------------------
+
+            with open(output_pdf, "rb") as processed_pdf:
+
+                new_file_id = fs.put(
+                    processed_pdf,
+                    filename=file.filename,
+                    content_type="application/pdf"
+                )
+
+            # ---------------------------------------------
+            # Return success response
+            # ---------------------------------------------
+
+            return jsonify({
+                "message": "PDF uploaded and converted to OCR successfully.",
+                "fileId": str(new_file_id),
+                "fileName": file.filename
+            }), 201
+
+    except ocrmypdf.exceptions.MissingDependencyError as e:
+
+        print("OCR dependency error:", e)
 
         return jsonify({
-            "message": "PDF uploaded successfully.",
-            "fileId": str(file_id),
-            "fileName": file.filename,
-            "current": True
-        }), 201
-
-    except Exception as e:
-        print("Upload error:", e)
-
-        return jsonify({
-            "message": "Failed to upload PDF."
+            "message": "OCR processing dependencies are missing.",
+            "error": str(e)
         }), 500
 
+    except Exception as e:
+
+        print("Upload/OCR error:", e)
+
+        return jsonify({
+            "message": "Failed to process PDF.",
+            "error": str(e)
+        }), 500
+
+
+# ---------------------------------------------------------
+# Get current document
+# ---------------------------------------------------------
 
 @app.route("/api/documents/current", methods=["GET"])
 def get_current_document():
 
     try:
-        # Find the document currently being used by Botpress
-        current_document = document_metadata.find_one(
-            {"type": "current_document"},
-            {"_id": 0}
-        )
 
-        # No document has been uploaded yet
-        if not current_document:
+        # Get all files currently stored in the documents
+        # GridFS bucket.
+
+        files = list(fs.find())
+
+        # No document available
+
+        if not files:
             return jsonify({
-                "message": "No document has been uploaded yet.",
+                "message": "No document is currently stored.",
                 "document": None
             }), 404
 
+        # Since our upload process deletes the old document
+        # before storing the new one, there should normally
+        # only be one file.
+        #
+        # We use the newest file if more than one somehow
+        # exists.
+
+        current_file = max(
+            files,
+            key=lambda x: x.upload_date
+        )
+
         return jsonify({
             "message": "Current document retrieved successfully.",
-            "document": current_document
+            "document": {
+                "fileId": str(current_file._id),
+                "fileName": current_file.filename,
+                "contentType": current_file.content_type,
+                "uploadDate": current_file.upload_date.isoformat()
+            }
         }), 200
 
     except Exception as e:
+
         print("Error retrieving current document:", e)
 
         return jsonify({
@@ -139,5 +227,12 @@ def get_current_document():
         }), 500
 
 
+# ---------------------------------------------------------
+# Run Flask server
+# ---------------------------------------------------------
+
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    app.run(
+        port=5000,
+        debug=True
+    )
