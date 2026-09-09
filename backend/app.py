@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
 from gridfs import GridFS
+from bson import ObjectId
 from dotenv import load_dotenv
 import os
 import tempfile
@@ -24,8 +25,8 @@ db = client[os.getenv("DATABASE_NAME", "BotPressTest")]
 # GridFS
 # ---------------------------------------------------------
 #
-# All current OCR-processed PDFs are stored in this GridFS
-# bucket.
+# All OCR-processed PDFs are stored in this GridFS bucket.
+# Old PDFs are kept permanently; only the active document changes.
 #
 fs = GridFS(db, collection="documents")
 
@@ -118,24 +119,14 @@ def upload_document():
             )
 
             # ---------------------------------------------
-            # Delete the existing document(s) from GridFS
-            # ---------------------------------------------
-            #
-            # We are intentionally replacing the previous
-            # document.
-            #
-            # Nothing is deleted until the OCR processing
-            # succeeds.
-            #
-
-            existing_files = fs.find()
-
-            for existing_file in existing_files:
-                fs.delete(existing_file._id)
-
-            # ---------------------------------------------
             # Store the new OCR PDF in GridFS
             # ---------------------------------------------
+            #
+            # IMPORTANT:
+            # Old PDFs are NOT deleted. GridFS acts as the
+            # document archive. The newest upload becomes
+            # the active/current document.
+            #
 
             with open(output_pdf, "rb") as processed_pdf:
 
@@ -184,25 +175,18 @@ def get_current_document():
     try:
 
         # Get all files currently stored in the documents
-        # GridFS bucket.
-
+        # GridFS bucket. Older files are intentionally kept.
         files = list(fs.find())
 
         # No document available
-
         if not files:
             return jsonify({
                 "message": "No document is currently stored.",
                 "document": None
             }), 404
 
-        # Since our upload process deletes the old document
-        # before storing the new one, there should normally
-        # only be one file.
-        #
-        # We use the newest file if more than one somehow
-        # exists.
-
+        # The newest uploaded document is the current document.
+        # Older documents remain available in GridFS as history.
         current_file = max(
             files,
             key=lambda x: x.upload_date
@@ -225,6 +209,74 @@ def get_current_document():
         return jsonify({
             "message": "Failed to retrieve current document."
         }), 500
+
+
+# ---------------------------------------------------------
+# Get all stored documents
+# ---------------------------------------------------------
+
+@app.route("/api/documents", methods=["GET"])
+def get_all_documents():
+
+    try:
+        files = list(fs.find())
+
+        # Sort newest first
+        files.sort(
+            key=lambda x: x.upload_date,
+            reverse=True
+        )
+
+        return jsonify({
+            "message": "Documents retrieved successfully.",
+            "documents": [
+                {
+                    "fileId": str(document._id),
+                    "fileName": document.filename,
+                    "contentType": document.content_type,
+                    "uploadDate": document.upload_date.isoformat()
+                }
+                for document in files
+            ]
+        }), 200
+
+    except Exception as e:
+
+        print("Error retrieving documents:", e)
+
+        return jsonify({
+            "message": "Failed to retrieve documents."
+        }), 500
+
+
+# ---------------------------------------------------------
+# Download a stored document
+# ---------------------------------------------------------
+
+@app.route("/api/documents/<file_id>", methods=["GET"])
+def download_document(file_id):
+
+    try:
+        document = fs.get(ObjectId(file_id))
+
+        response = app.response_class(
+            document.read(),
+            mimetype=document.content_type
+        )
+
+        response.headers["Content-Disposition"] = (
+            'inline; filename="{}"'.format(document.filename)
+        )
+
+        return response
+
+    except Exception as e:
+
+        print("Error retrieving document:", e)
+
+        return jsonify({
+            "message": "Document not found."
+        }), 404
 
 
 # ---------------------------------------------------------
